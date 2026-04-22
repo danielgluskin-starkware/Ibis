@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/url"
+	"reflect"
 	"strings"
 
 	"github.com/jackc/pgx/v5"
@@ -22,8 +24,7 @@ type PostgresStore struct {
 
 // New creates a new PostgresStore from the given config.
 func New(ctx context.Context, cfg config.PostgresConfig) (*PostgresStore, error) {
-	connStr := fmt.Sprintf("postgres://%s:%s@%s:%d/%s?sslmode=disable",
-		cfg.User, cfg.Password, cfg.Host, cfg.Port, cfg.Name)
+	connStr := buildConnString(cfg)
 
 	pool, err := pgxpool.New(ctx, connStr)
 	if err != nil {
@@ -46,6 +47,24 @@ func New(ctx context.Context, cfg config.PostgresConfig) (*PostgresStore, error)
 	}
 
 	return s, nil
+}
+
+// buildConnString produces a pgx-compatible connection string for the given
+// config. When the host is an absolute path (e.g. a Unix socket such as
+// Cloud SQL's /cloudsql/PROJECT:REGION:INSTANCE), URL-form is unsafe — the
+// leading slash and colons mangle the host/database split — so we emit the
+// keyword DSN form. Otherwise we emit the URL form with user/password
+// URL-encoded to tolerate special characters.
+func buildConnString(cfg config.PostgresConfig) string {
+	if strings.HasPrefix(cfg.Host, "/") {
+		return fmt.Sprintf(
+			"host=%s port=%d user=%s password=%s dbname=%s sslmode=disable",
+			cfg.Host, cfg.Port, cfg.User, cfg.Password, cfg.Name,
+		)
+	}
+	return fmt.Sprintf("postgres://%s:%s@%s:%d/%s?sslmode=disable",
+		url.QueryEscape(cfg.User), url.QueryEscape(cfg.Password),
+		cfg.Host, cfg.Port, cfg.Name)
 }
 
 // NewFromPool creates a PostgresStore from an existing connection pool (for testing).
@@ -733,8 +752,12 @@ func (s *PostgresStore) buildSelectQuery(table string, q store.Query) (query str
 	if q.OrderDir == store.OrderDesc {
 		dir = "DESC"
 	}
-	// Secondary sort by log_index for stable ordering.
-	orderClause := fmt.Sprintf("%s %s, %s %s", orderBy, dir, qid("log_index"), dir)
+	// Secondary sort by log_index for stable ordering when available. View
+	// tables don't have a log_index column; skip the secondary sort there.
+	orderClause := fmt.Sprintf("%s %s", orderBy, dir)
+	if hasLogIndexColumn(s.schemas, table) {
+		orderClause = fmt.Sprintf("%s %s, %s %s", orderBy, dir, qid("log_index"), dir)
+	}
 
 	limit := q.Limit
 	if limit <= 0 {
@@ -746,6 +769,23 @@ func (s *PostgresStore) buildSelectQuery(table string, q store.Query) (query str
 	args = append(args, limit, q.Offset)
 
 	return query, args
+}
+
+// hasLogIndexColumn reports whether the table's schema includes a log_index
+// column. Event tables do; view-result tables don't. When no schema is
+// registered we conservatively assume log_index is present so the existing
+// behaviour is preserved.
+func hasLogIndexColumn(schemas map[string]types.TableSchema, table string) bool {
+	sch, ok := schemas[table]
+	if !ok {
+		return true
+	}
+	for _, col := range sch.Columns {
+		if col.Name == "log_index" {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *PostgresStore) buildUniqueSelectQuery(table, uniqueKey string, q store.Query) (query string, args []any) {
@@ -786,16 +826,28 @@ func (s *PostgresStore) buildUniqueSelectQuery(table, uniqueKey string, q store.
 		distinctCols = qid("contract_address") + ", " + qid(uniqueKey)
 	}
 
+	// For event tables we need log_index to deterministically pick the latest
+	// row per unique_key. For view-result tables (no log_index column) ordering
+	// by block_number alone is sufficient — each poll produces one row per
+	// unique_key per block, so the highest block_number is unambiguously the
+	// newest.
+	innerTieBreak := fmt.Sprintf("%s DESC", qid("block_number"))
+	outerTieBreak := ""
+	if hasLogIndexColumn(s.schemas, table) {
+		innerTieBreak = fmt.Sprintf("%s DESC, %s DESC", qid("block_number"), qid("log_index"))
+		outerTieBreak = fmt.Sprintf(", %s %s", qid("log_index"), dir)
+	}
+
 	// Use DISTINCT ON to get latest per unique key, then wrap for ordering/pagination.
 	query = fmt.Sprintf(
 		`SELECT %s FROM (
 			SELECT DISTINCT ON (%s) %s
 			FROM %s%s
-			ORDER BY %s, %s DESC, %s DESC
-		) sub ORDER BY %s %s, %s %s LIMIT $%d OFFSET $%d`,
+			ORDER BY %s, %s
+		) sub ORDER BY %s %s%s LIMIT $%d OFFSET $%d`,
 		cols, distinctCols, cols, table, where,
-		distinctCols, qid("block_number"), qid("log_index"),
-		orderBy, dir, qid("log_index"), dir, argIdx, argIdx+1)
+		distinctCols, innerTieBreak,
+		orderBy, dir, outerTieBreak, argIdx, argIdx+1)
 	args = append(args, limit, q.Offset)
 
 	return query, args
@@ -906,6 +958,31 @@ func populateFromData(evt *types.IndexedEvent) {
 	}
 }
 
+// stringifyForTextColumn coerces a decoded Cairo value into a TEXT column.
+// Atomic values (already a Go string, bigint, number, bool, etc.) go through
+// fmt.Sprint — matching the original behaviour. Compound values (Cairo arrays,
+// tuples, structs, enums) are produced by the ABI decoder as []any /
+// map[string]any / nested combinations; fmt.Sprint renders those with Go's
+// "[map[k:v]]" default form which is not a parseable format for API consumers.
+// The schema generator deliberately labels those columns "JSON-encoded" — honour
+// that contract by encoding them as JSON here.
+func stringifyForTextColumn(v any) string {
+	if v == nil {
+		return ""
+	}
+	if s, ok := v.(string); ok {
+		return s
+	}
+	rv := reflect.ValueOf(v)
+	switch rv.Kind() {
+	case reflect.Slice, reflect.Array, reflect.Map, reflect.Struct:
+		if b, err := json.Marshal(v); err == nil {
+			return string(b)
+		}
+	}
+	return fmt.Sprint(v)
+}
+
 func convertValue(v any, colType string) any {
 	switch colType {
 	case "uint64", "int64":
@@ -918,7 +995,7 @@ func convertValue(v any, colType string) any {
 			return fmt.Sprint(v) == "true"
 		}
 	case "string":
-		return fmt.Sprint(v)
+		return stringifyForTextColumn(v)
 	case "[]byte":
 		switch b := v.(type) {
 		case []byte:
